@@ -21,7 +21,8 @@ The resulting versioning schema looks like this: 3.0.0-es5.2.0, where the plugin
         }
     }'
 ```
-
+ 
+ 
 See [Snapshot And Restore](https://www.elastic.co/guide/en/elasticsearch/reference/current/modules-snapshots.html) for more information
 
 
