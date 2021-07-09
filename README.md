@@ -1,3 +1,4 @@
+
 Swift repository plugin for Elasticsearch
 =========================================
 
@@ -35,28 +36,29 @@ See [Snapshot And Restore](https://www.elastic.co/guide/en/elasticsearch/referen
 | swift_tenantname                    | Authenticate against project scope using this tenant name, only used with keystone auth
 | swift_password                      | Swift password
 | swift_username                      | Swift username
-| swift_preferred_region              | Region to use.  If you do not specify a region, Swift will pick the endpoint of the first region.  If you have multiple regions, the order is not guarenteed.
+| swift_preferred_region              | Region to use.  If you do not specify a region, Swift will pick the endpoint of the first region.  If you have multiple regions, the order is not guarenteed
 | chunk_size                          | Maximum size for individual objects in the snapshot. Defaults to `5gb` as that's the Swift default
 | compress                            | Turns on compression of the snapshot files. Defaults to `false` as it tends to break with Swift
-| max_restore_bytes_per_sec           | Throttles per node restore rate. Defaults to `20mb` per second.
-| max_snapshot_bytes_per_sec          | Throttles per node snapshot rate. Defaults to `20mb` per second.
+| max_restore_bytes_per_sec           | Throttles per node restore rate. Defaults to `20mb` per second
+| max_snapshot_bytes_per_sec          | Throttles per node snapshot rate. Defaults to `20mb` per second
 
 ## Configuration Settings
 Plugin settings to be placed in elasticsearch YAML configuration. Keep defaults, unless problems are detected.
 
 |  Setting                                     |   Description
 |----------------------------------------------|------------------------------------------------------------
-| repository_swift.minimize_blob_exists_checks | true (default) or false. Reduces volume of SWIFT requests to check a blob's existence.
+| repository_swift.minimize_blob_exists_checks | true (default) or false. Reduces volume of SWIFT requests to check a blob's existence
 | repository_swift.allow_caching               | true or false (default). Allow JOSS caching
-| repository_swift.allow_concurrent_io         | true (default) or false. Allow concurrent writes and deletes.
-| repository_swift.delete_timeout_min          | timeout of snapshot deletion in minutes (default 60 min)
-| repository_swift.retry_interval_s            | interval in seconds for retry-until-success-or-timeout pattern in seconds (default 10 s)
+| repository_swift.allow_concurrent_io         | true (default) or false. Allow concurrent writes and deletes
+| repository_swift.max_io_requests             | max number of concurrent Swift I/O requests (default 10)
+| repository_swift.delete_timeout              | timeout of snapshot deletion (default 60m), must include unit suffix, like ms, s, m.
+| repository_swift.retry_interval              | interval for retry-until-success-or-timeout pattern (default 10s), must include unit suffix, like ms, s, m.
 | repository_swift.retry_count                 | number of attempts for retries where timing is impractical (default 3 times)
-| repository_swift.short_operation_timeout_s   | timeout for short operations (like writing a small blob, deleting, or listing) in seconds (default 30 s)
-| repository_swift.long_operation_timeout_s    | timeout for long operations (like writing of multi-Gig data stream) in seconds (default 600 s)
-| repository_swift.snapshot_timeout_min        | timeout of taking a snapshot in minutes (default 360 min)
-| repository_swift.stream_read                 | true (default) or false. Reduce memory footprint on restore, at the expense of not being able to retry reads on failure.
-| repository_swift.stream_write                | true or false (default). Reduce memory footprint on snapshot, at the expense of not writing concurrently.
+| repository_swift.short_operation_timeout     | timeout for short operations (like writing a small blob, deleting, or listing) (default 2m), must include unit suffix, like ms, s, m.
+| repository_swift.long_operation_timeout      | timeout for long operations (like writing of multi-Gig data stream) (default 20m), must include unit suffix, like ms, s, m.
+| repository_swift.snapshot_timeout            | timeout of taking a snapshot in minutes (default 360m), must include unit suffix, like ms, s, m.
+| repository_swift.stream_write                | true or false (default). Reduce memory footprint on snapshot, at the expense of not writing concurrently
+| repository_swift.blob_local_dir              | path to temoporary storage for blobs in filesystem. Default is _/var/repository_swift_
 
 ## To debug in Eclipse
 Since Swift has logging dependencies you have to be careful about debugging in Eclipse.

@@ -5,4 +5,8 @@ grant {
   permission java.net.NetPermission "getProxySelector";
   // replace * with safe address:port combination(s)
   // permission java.net.SocketPermission "*", "connect,resolve";
+  // replace path with blob_local_dir value
+  // permission java.io.FilePermission "/var", "read,write,delete";
+  // permission java.io.FilePermission "/var/repository_swift", "read,write,delete";
+  // permission java.io.FilePermission "/var/repository_swift/-", "read,write,delete";
 };

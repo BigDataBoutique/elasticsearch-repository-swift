@@ -16,6 +16,7 @@
 
 package org.wikimedia.elasticsearch.swift.repositories;
 
+import org.apache.commons.io.FileUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.IndexCommit;
@@ -31,6 +32,8 @@ import org.elasticsearch.common.settings.Setting;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.ByteSizeUnit;
 import org.elasticsearch.common.unit.ByteSizeValue;
+import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.common.util.concurrent.FutureUtils;
 import org.elasticsearch.common.xcontent.NamedXContentRegistry;
 import org.elasticsearch.index.mapper.MapperService;
 import org.elasticsearch.index.shard.ShardId;
@@ -45,28 +48,29 @@ import org.elasticsearch.snapshots.SnapshotInfo;
 import org.elasticsearch.snapshots.SnapshotShardFailure;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.javaswift.joss.model.Account;
+import org.wikimedia.elasticsearch.swift.SwiftPerms;
 import org.wikimedia.elasticsearch.swift.repositories.account.SwiftAccountFactory;
 import org.wikimedia.elasticsearch.swift.repositories.blobstore.SwiftBlobStore;
 
 import java.util.List;
 import java.util.Map;
-
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
 
 /**
  * The blob store repository. A glorified settings wrapper.
  */
 public class SwiftRepository extends BlobStoreRepository {
-    // The internal "type" for Elasticsearch
+    // The internal "type" for Elasticsearch Swift repository
     public static final String TYPE = "swift";
 
     /**
      * Swift repository settings
      */
     public interface Swift {
+        String PREFIX = "repository_swift";
+
         Setting<String> CONTAINER_SETTING = Setting.simpleString("swift_container");
         Setting<String> URL_SETTING = Setting.simpleString("swift_url");
         Setting<String> AUTHMETHOD_SETTING = Setting.simpleString("swift_authmethod");
@@ -78,49 +82,52 @@ public class SwiftRepository extends BlobStoreRepository {
         Setting<ByteSizeValue> CHUNK_SIZE_SETTING = Setting.byteSizeSetting("chunk_size",
                                                                             new ByteSizeValue(5, ByteSizeUnit.GB));
         Setting<Boolean> COMPRESS_SETTING = Setting.boolSetting("compress", false);
-        Setting<Boolean> MINIMIZE_BLOB_EXISTS_CHECKS_SETTING = Setting.boolSetting("repository_swift.minimize_blob_exists_checks",
+        Setting<Boolean> MINIMIZE_BLOB_EXISTS_CHECKS_SETTING = Setting.boolSetting(PREFIX+".minimize_blob_exists_checks",
                                                                                    true,
                                                                                     Setting.Property.NodeScope);
-        Setting<Boolean> ALLOW_CACHING_SETTING = Setting.boolSetting("repository_swift.allow_caching",
+        Setting<Boolean> ALLOW_CACHING_SETTING = Setting.boolSetting(PREFIX+".allow_caching",
                                                                      true,
                                                                      Setting.Property.NodeScope);
 
-        Setting<Long> DELETE_TIMEOUT_MIN_SETTING = Setting.longSetting("repository_swift.delete_timeout_min",
-                60,
-                0,
-                Setting.Property.NodeScope);
+        Setting<Integer> MAX_IO_REQUESTS = Setting.intSetting(PREFIX+".max_io_requests",
+            10,
+            Setting.Property.NodeScope);
 
-        Setting<Integer> SNAPSHOT_TIMEOUT_MIN_SETTING = Setting.intSetting("repository_swift.snapshot_timeout_min",
-                360,
-                Setting.Property.NodeScope);
+        Setting<TimeValue> DELETE_TIMEOUT_SETTING = Setting.timeSetting(PREFIX+".delete_timeout",
+            new TimeValue(60, TimeUnit.MINUTES),
+            Setting.Property.NodeScope);
 
-        Setting<Integer> SHORT_OPERATION_TIMEOUT_S_SETTING = Setting.intSetting("repository_swift.short_operation_timeout_s",
-                30,
-                Setting.Property.NodeScope);
+        Setting<TimeValue> SNAPSHOT_TIMEOUT_SETTING = Setting.timeSetting(PREFIX+".snapshot_timeout",
+            new TimeValue(360, TimeUnit.MINUTES),
+            Setting.Property.NodeScope);
 
-        Setting<Integer> LONG_OPERATION_TIMEOUT_S_SETTING = Setting.intSetting("repository_swift.long_operation_timeout_s",
-                600,
-                Setting.Property.NodeScope);
+        Setting<TimeValue> SHORT_OPERATION_TIMEOUT_SETTING = Setting.timeSetting(PREFIX+".short_operation_timeout",
+            new TimeValue(2, TimeUnit.MINUTES),
+            Setting.Property.NodeScope);
 
-        Setting<Integer> RETRY_INTERVAL_S_SETTING = Setting.intSetting("repository_swift.retry_interval_s",
-                10,
-                Setting.Property.NodeScope);
+        Setting<TimeValue> LONG_OPERATION_TIMEOUT_SETTING = Setting.timeSetting(PREFIX+".long_operation_timeout",
+            new TimeValue(20, TimeUnit.MINUTES),
+            Setting.Property.NodeScope);
 
-        Setting<Integer> RETRY_COUNT_SETTING = Setting.intSetting("repository_swift.retry_count",
-                3,
-                Setting.Property.NodeScope);
+        Setting<TimeValue> RETRY_INTERVAL_SETTING = Setting.timeSetting(PREFIX+".retry_interval",
+            new TimeValue(10, TimeUnit.SECONDS),
+            Setting.Property.NodeScope);
 
-        Setting<Boolean> ALLOW_CONCURRENT_IO_SETTING = Setting.boolSetting("repository_swift.allow_concurrent_io",
-                true,
-                Setting.Property.NodeScope);
+        Setting<Integer> RETRY_COUNT_SETTING = Setting.intSetting(PREFIX+".retry_count",
+            3,
+            Setting.Property.NodeScope);
 
-        Setting<Boolean> STREAM_READ_SETTING = Setting.boolSetting("repository_swift.stream_read",
-                true,
-                Setting.Property.NodeScope);
+        Setting<Boolean> ALLOW_CONCURRENT_IO_SETTING = Setting.boolSetting(PREFIX+".allow_concurrent_io",
+            true,
+            Setting.Property.NodeScope);
 
-        Setting<Boolean> STREAM_WRITE_SETTING = Setting.boolSetting("repository_swift.stream_write",
-                false,
-                Setting.Property.NodeScope);
+        Setting<Boolean> STREAM_WRITE_SETTING = Setting.boolSetting(PREFIX+".stream_write",
+            false,
+            Setting.Property.NodeScope);
+
+        Setting<String> BLOB_LOCAL_DIR_SETTING = Setting.simpleString(PREFIX + ".blob_local_dir",
+            "/var/"+PREFIX,
+            Setting.Property.NodeScope);
     }
 
     private static final Logger logger = LogManager.getLogger(SwiftRepository.class);
@@ -131,15 +138,8 @@ public class SwiftRepository extends BlobStoreRepository {
     // Chunk size.
     private final ByteSizeValue chunkSize;
 
-    private final Settings settings;
+    private final Settings repoSettings;
     private final Settings envSettings;
-
-    public Settings getSettings() {
-        return settings;
-    }
-    public Settings getEnvSettings() {
-        return envSettings;
-    }
 
     private final ConcurrentHashMap<String, Future<DeleteResult>> blobDeletionTasks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Future<Void>> blobWriteTasks = new ConcurrentHashMap<>();
@@ -150,7 +150,7 @@ public class SwiftRepository extends BlobStoreRepository {
      *
      * @param metadata
      *            repository meta data
-     * @param settings
+     * @param repoSettings
      *            repo settings
      * @param envSettings
      *            global settings
@@ -163,17 +163,23 @@ public class SwiftRepository extends BlobStoreRepository {
      */
     @Inject
     public SwiftRepository(final RepositoryMetaData metadata,
-                           final Settings settings,
+                           final Settings repoSettings,
                            final Settings envSettings,
                            final NamedXContentRegistry namedXContentRegistry,
                            final ThreadPool threadPool,
                            final SwiftAccountFactory accountFactory) {
-        super(metadata, Swift.COMPRESS_SETTING.get(settings), namedXContentRegistry, threadPool);
-        this.settings = settings;
+        super(metadata, Swift.COMPRESS_SETTING.get(repoSettings), namedXContentRegistry, threadPool);
+        this.repoSettings = repoSettings;
         this.envSettings = envSettings;
-        this.chunkSize = Swift.CHUNK_SIZE_SETTING.get(settings);
+        this.chunkSize = Swift.CHUNK_SIZE_SETTING.get(repoSettings);
         this.basePath = BlobPath.cleanPath();
         this.accountFactory = accountFactory;
+    }
+
+    @Override
+    protected void doStart() {
+        super.doStart();
+        clearStoredBlobs();
     }
 
     @Override
@@ -185,8 +191,12 @@ public class SwiftRepository extends BlobStoreRepository {
     @Override
     public void deleteSnapshot(SnapshotId snapshotId, long repositoryStateId, ActionListener<Void> listener) {
         initializeBlobTasks();
-        super.deleteSnapshot(snapshotId, repositoryStateId, listener);
-        finalizeBlobTasks(snapshotId.toString(), listener);
+        try{
+            super.deleteSnapshot(snapshotId, repositoryStateId, listener);
+        }
+        finally {
+            finalizeBlobTasks(snapshotId.toString(), listener);
+        }
     }
 
     private void initializeBlobTasks() {
@@ -202,31 +212,26 @@ public class SwiftRepository extends BlobStoreRepository {
     // Intent of this method is to provide a wait that delays completion of potentially mutually exclusive operations
     // in Elasticsearch
     //
-    private void finalizeBlobDeletion(String operationId, ActionListener<?> listener, final long timeLimit) {
+    private void finalizeBlobDeletion(String operationId, ActionListener<?> listener, final TimeValue timeout) {
         long failedCount = 0;
+        final long nanoTimeLimit = System.nanoTime() + timeout.nanos();
 
         for (Map.Entry<String, Future<DeleteResult>> entry: blobDeletionTasks.entrySet()) {
-            try {
-                long remaining_ns = timeLimit - System.nanoTime();
-                if (remaining_ns < 0) {
-                    throw new TimeoutException();
-                }
+            String blobName = entry.getKey();
+            Future<DeleteResult> task = entry.getValue();
 
-                entry.getValue().get(remaining_ns, TimeUnit.NANOSECONDS);
-            }
-            catch (TimeoutException e){
-                long notDoneCount = blobDeletionTasks.values().stream().filter(t -> !t.isDone()).count();
-                if (listener != null){
-                    listener.onFailure(new RepositoryException(metadata.name(),
-                        "failed to delete snapshot [" + operationId + "]: timed out, " + notDoneCount + " deletions in progress"));
-                }
-                return; // Stop processing
+            try {
+                long remaining_ns = Math.max(nanoTimeLimit - System.nanoTime(), 0);
+
+                FutureUtils.get(task, remaining_ns, TimeUnit.NANOSECONDS);
             }
             catch (Exception e) {
-                logger.warn("failed to delete blob [" + entry.getKey() + "]", e);
+                logger.warn("Failed to delete blob [" + blobName + "], snapshot ["+ operationId + "]. Cancelling task", e);
+                FutureUtils.cancel(task);
                 failedCount++;
             }
         }
+        blobDeletionTasks.clear();
 
         if (failedCount > 0 && listener != null){
             listener.onFailure(new RepositoryException(metadata.name(),
@@ -234,15 +239,20 @@ public class SwiftRepository extends BlobStoreRepository {
         }
     }
 
-    private void finalizeBlobTasks(String operationId, ActionListener<?> listener) {
-        long now = System.nanoTime();
-        final long deleteTimeLimit = now + TimeUnit.NANOSECONDS.convert(Swift.DELETE_TIMEOUT_MIN_SETTING.get(envSettings),
-                                                                        TimeUnit.MINUTES);
-        final long snapshotTimeLimit = now + TimeUnit.NANOSECONDS.convert(Swift.SNAPSHOT_TIMEOUT_MIN_SETTING.get(envSettings),
-                                                                          TimeUnit.MINUTES);
+    private void clearStoredBlobs(){
+        String blobDir = Swift.BLOB_LOCAL_DIR_SETTING.get(envSettings);
+        try {
+            SwiftPerms.execThrows(() ->
+                FileUtils.cleanDirectory(FileUtils.getFile(blobDir)));
+        }
+        catch (Exception e){
+            logger.warn("Unable to clean directory ["+blobDir+"]", e);
+        }
+    }
 
-        finalizeBlobWrite(operationId, listener, snapshotTimeLimit);
-        finalizeBlobDeletion(operationId, listener, deleteTimeLimit);
+    private void finalizeBlobTasks(String operationId, ActionListener<?> listener) {
+        finalizeBlobWrite(operationId, listener, Swift.SNAPSHOT_TIMEOUT_SETTING.get(envSettings));
+        finalizeBlobDeletion(operationId, listener, Swift.DELETE_TIMEOUT_SETTING.get(envSettings));
     }
 
     public void addWrite(String blobName, Future<Void> task) {
@@ -253,31 +263,26 @@ public class SwiftRepository extends BlobStoreRepository {
     // Intent of this method is to provide a wait that delays completion of potentially mutually exclusive operations
     // in Elasticsearch
     //
-    private void finalizeBlobWrite(String operationId, ActionListener<?> listener, final long timeLimit) {
+    private void finalizeBlobWrite(String operationId, ActionListener<?> listener, final TimeValue timeout) {
         long failedCount = 0;
+        final long nanoTimeLimit = System.nanoTime() + timeout.nanos();
 
         for (Map.Entry<String, Future<Void>> entry: blobWriteTasks.entrySet()) {
-            try {
-                long remaining_ns = timeLimit - System.nanoTime();
-                if (remaining_ns < 0) {
-                    throw new TimeoutException();
-                }
+            String blobName = entry.getKey();
+            Future<Void> task = entry.getValue();
 
-                entry.getValue().get(remaining_ns, TimeUnit.NANOSECONDS);
-            }
-            catch (TimeoutException e){
-                long notDoneCount = blobWriteTasks.values().stream().filter(t -> !t.isDone()).count();
-                if (listener != null){
-                    listener.onFailure(new RepositoryException(metadata.name(),
-                            "failed to complete writes [" + operationId + "]: timed out, " + notDoneCount + " writes in progress"));
-                }
-                return; // Stop processing
+            try {
+                long remaining_ns = Math.max(nanoTimeLimit - System.nanoTime(), 0);
+
+                FutureUtils.get(task, remaining_ns, TimeUnit.NANOSECONDS);
             }
             catch (Exception e) {
-                logger.warn("failed to complete writes [" + entry.getKey() + "]", e);
+                logger.warn("Failed to write blob [" + blobName + "], snapshot ["+ operationId + "]. Cancelling task", e);
+                FutureUtils.cancel(task);
                 failedCount++;
             }
         }
+        blobWriteTasks.clear();
 
         if (failedCount > 0 && listener != null){
             listener.onFailure(new RepositoryException(metadata.name(),
@@ -288,8 +293,11 @@ public class SwiftRepository extends BlobStoreRepository {
     @Override
     public void cleanup(long repositoryStateId, ActionListener<RepositoryCleanupResult> listener) {
         initializeBlobTasks();
-        super.cleanup(repositoryStateId, listener);
-        finalizeBlobTasks(String.valueOf(repositoryStateId), listener);
+        try {
+            super.cleanup(repositoryStateId, listener);
+        } finally {
+            finalizeBlobTasks(String.valueOf(repositoryStateId), listener);
+        }
     }
 
     @Override
@@ -297,9 +305,12 @@ public class SwiftRepository extends BlobStoreRepository {
                                  int totalShards, List<SnapshotShardFailure> shardFailures, long repositoryStateId,
                                  boolean includeGlobalState, MetaData clusterMetaData, Map<String, Object> userMetadata,
                                  ActionListener<SnapshotInfo> listener) {
-        super.finalizeSnapshot(snapshotId, indices, startTime, failure, totalShards, shardFailures, repositoryStateId,
-                includeGlobalState, clusterMetaData, userMetadata, listener);
-        finalizeBlobTasks(snapshotId.toString(), listener);
+        try {
+            super.finalizeSnapshot(snapshotId, indices, startTime, failure, totalShards, shardFailures, repositoryStateId,
+                    includeGlobalState, clusterMetaData, userMetadata, listener);
+        } finally {
+            finalizeBlobTasks(snapshotId.toString(), listener);
+        }
     }
 
     @Override
@@ -310,8 +321,11 @@ public class SwiftRepository extends BlobStoreRepository {
 
     @Override
     public void endVerification(String seed) {
-        super.endVerification(seed);
-        finalizeBlobTasks("verification", null);
+        try {
+            super.endVerification(seed);
+        } finally {
+            finalizeBlobTasks("verification", null);
+        }
     }
 
     @Override
@@ -327,19 +341,19 @@ public class SwiftRepository extends BlobStoreRepository {
     }
 
     protected BlobStore createBlobStore() {
-        String username = Swift.USERNAME_SETTING.get(settings);
-        String password = Swift.PASSWORD_SETTING.get(settings);
-        String tenantName = Swift.TENANTNAME_SETTING.get(settings);
-        String domainName = Swift.DOMAINNAME_SETTING.get(settings);
-        String authMethod = Swift.AUTHMETHOD_SETTING.get(settings);
-        String preferredRegion = Swift.PREFERRED_REGION_SETTING.get(settings);
+        String username = Swift.USERNAME_SETTING.get(repoSettings);
+        String password = Swift.PASSWORD_SETTING.get(repoSettings);
+        String tenantName = Swift.TENANTNAME_SETTING.get(repoSettings);
+        String domainName = Swift.DOMAINNAME_SETTING.get(repoSettings);
+        String authMethod = Swift.AUTHMETHOD_SETTING.get(repoSettings);
+        String preferredRegion = Swift.PREFERRED_REGION_SETTING.get(repoSettings);
 
-        String containerName = Swift.CONTAINER_SETTING.get(settings);
+        String containerName = Swift.CONTAINER_SETTING.get(repoSettings);
         if (containerName == null) {
             throw new RepositoryException(metadata.name(), "No container defined for swift repository");
         }
 
-        String url = Swift.URL_SETTING.get(settings);
+        String url = Swift.URL_SETTING.get(repoSettings);
         if (url == null) {
             throw new RepositoryException(metadata.name(), "No url defined for swift repository");
         }
@@ -352,7 +366,7 @@ public class SwiftRepository extends BlobStoreRepository {
             authMethod,
             preferredRegion);
 
-        return new SwiftBlobStore(this, settings, envSettings, account, containerName);
+        return new SwiftBlobStore(this, repoSettings, envSettings, account, containerName);
     }
 
     /**

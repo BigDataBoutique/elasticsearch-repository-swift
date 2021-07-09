@@ -42,7 +42,7 @@ ext {
     httpcoreVersion = '4.4.12'
     javaxActivationVersion = '1.1'
     junitVersion = '4.12'
-    jossVersion = '0.10.3'
+    jossVersion = '0.10.4'
     slf4jVersion = '1.7.26'
 }
 
@@ -69,13 +69,13 @@ dependencies {
     compile group: 'org.apache.httpcomponents', name: 'httpclient', version: httpclientVersion
     compile group: 'commons-codec', name: 'commons-codec', version: commonsCodecVersion
     compile group: 'commons-lang', name: 'commons-lang', version: commonslangVersion
+    compile group: 'commons-io', name: 'commons-io', version: commonsioVersion
     runtime group: 'org.apache.httpcomponents', name: 'httpcore', version: httpcoreVersion
     runtime group: 'javax.activation', name: 'activation', version: javaxActivationVersion
     runtime group: 'org.slf4j', name: 'slf4j-api', version: slf4jVersion
     runtime group: 'org.slf4j', name: 'slf4j-log4j12', version: slf4jVersion
     runtime group: 'commons-logging', name: 'commons-logging', version: commonsloggingVersion
     runtime group: 'org.codehaus.jackson', name: 'jackson-mapper-asl', version: jacksonmapperVersion
-    runtime group: 'commons-io', name: 'commons-io', version: commonsioVersion
     testCompile group: 'junit', name: 'junit', version: junitVersion
     testCompile group: 'org.elasticsearch.test', name: 'framework', version: elasticsearchVersion
 }

@@ -17,6 +17,7 @@
 package org.wikimedia.elasticsearch.swift.repositories.blobstore;
 
 import org.apache.commons.codec.digest.DigestUtils;
+import org.apache.commons.io.input.CloseShieldInputStream;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.elasticsearch.common.Nullable;
@@ -28,6 +29,7 @@ import org.elasticsearch.common.blobstore.DeleteResult;
 import org.elasticsearch.common.blobstore.support.AbstractBlobContainer;
 import org.elasticsearch.common.blobstore.support.PlainBlobMetaData;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.javaswift.joss.client.core.ContainerPaginationMap;
 import org.javaswift.joss.exception.NotFoundException;
@@ -37,28 +39,24 @@ import org.javaswift.joss.model.Directory;
 import org.javaswift.joss.model.DirectoryOrObject;
 import org.javaswift.joss.model.StoredObject;
 import org.wikimedia.elasticsearch.swift.SwiftPerms;
-import org.wikimedia.elasticsearch.swift.util.retry.WithTimeout;
 import org.wikimedia.elasticsearch.swift.repositories.SwiftRepository;
-import org.wikimedia.elasticsearch.swift.util.stream.InputStreamWrapperWithDataHash;
+import org.wikimedia.elasticsearch.swift.util.blob.SavedBlob;
+import org.wikimedia.elasticsearch.swift.util.retry.WithTimeout;
+import org.wikimedia.elasticsearch.swift.util.stream.DataHashInputStream;
+import org.wikimedia.elasticsearch.swift.util.stream.JossInputStream;
+import org.wikimedia.elasticsearch.swift.util.stream.StreamClosedException;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.FileAlreadyExistsException;
-
 import java.nio.file.NoSuchFileException;
-import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
-
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
 /**
  * Swift's implementation of the AbstractBlobContainer
@@ -68,18 +66,19 @@ public class SwiftBlobContainer extends AbstractBlobContainer {
 
     // Our local swift blob store instance
     private final SwiftBlobStore blobStore;
+
     private final SwiftRepository repository;
+    private final SavedBlob.Factory blobSaver;
 
     // The root path for blobs. Used by buildKey to build full blob names
     private final String keyPath;
 
     private final boolean blobExistsCheckAllowed;
-    private final int retryIntervalS;
+    private final TimeValue retryInterval;
     private final int retryCount;
-    private final int shortOperationTimeoutS;
-    private final int longOperationTimeoutS;
+    private final TimeValue shortOperationTimeout;
+    private final TimeValue longOperationTimeout;
     private final boolean allowConcurrentIO;
-    private final boolean streamRead;
     private final boolean streamWrite;
 
     private final ExecutorService executor;
@@ -89,10 +88,13 @@ public class SwiftBlobContainer extends AbstractBlobContainer {
      * Constructor
      * @param blobStore The blob store to use for operations
      * @param path The BlobPath to find blobs in
+     * @param blobSaver factory to persist blobs
      */
-    protected SwiftBlobContainer(SwiftBlobStore blobStore, BlobPath path) {
+    protected SwiftBlobContainer(SwiftBlobStore blobStore, BlobPath path, SavedBlob.Factory blobSaver) {
         super(path);
         this.blobStore = blobStore;
+        this.blobSaver = blobSaver;
+
         repository = blobStore.getRepository();
         final Settings envSettings = blobStore.getEnvSettings();
 
@@ -102,23 +104,22 @@ public class SwiftBlobContainer extends AbstractBlobContainer {
         allowConcurrentIO = SwiftRepository.Swift.ALLOW_CONCURRENT_IO_SETTING.get(envSettings) &&
             executor instanceof ThreadPoolExecutor && ((ThreadPoolExecutor)executor).getMaximumPoolSize() > 2;
 
-        withTimeoutFactory = new WithTimeout.Factory();
+        withTimeoutFactory = new WithTimeout.Factory(envSettings, logger);
 
         String pathString = path.buildAsString();
         keyPath = pathString.isEmpty() || pathString.endsWith("/") ? pathString : pathString + "/";
 
         boolean minimizeBlobExistsChecks = SwiftRepository.Swift.MINIMIZE_BLOB_EXISTS_CHECKS_SETTING.get(envSettings);
         blobExistsCheckAllowed = pathString.isEmpty() || !minimizeBlobExistsChecks;
-        retryIntervalS = SwiftRepository.Swift.RETRY_INTERVAL_S_SETTING.get(envSettings);
+        retryInterval = SwiftRepository.Swift.RETRY_INTERVAL_SETTING.get(envSettings);
         retryCount = SwiftRepository.Swift.RETRY_COUNT_SETTING.get(envSettings);
-        shortOperationTimeoutS = SwiftRepository.Swift.SHORT_OPERATION_TIMEOUT_S_SETTING.get(envSettings);
-        longOperationTimeoutS = SwiftRepository.Swift.LONG_OPERATION_TIMEOUT_S_SETTING.get(envSettings);
-        streamRead = SwiftRepository.Swift.STREAM_READ_SETTING.get(envSettings);
+        shortOperationTimeout = SwiftRepository.Swift.SHORT_OPERATION_TIMEOUT_SETTING.get(envSettings);
+        longOperationTimeout = SwiftRepository.Swift.LONG_OPERATION_TIMEOUT_SETTING.get(envSettings);
         streamWrite = SwiftRepository.Swift.STREAM_WRITE_SETTING.get(envSettings);
     }
 
     private WithTimeout withTimeout() {
-        return withTimeoutFactory.from(repository != null && allowConcurrentIO ? repository.threadPool() : null);
+        return repository != null ? withTimeoutFactory.create(repository.threadPool()) : withTimeoutFactory.createWithoutPool();
     }
 
     /**
@@ -152,26 +153,33 @@ public class SwiftBlobContainer extends AbstractBlobContainer {
     private DeleteResult internalDeleteBlob(String blobName) throws Exception {
         final String objectName = buildKey(blobName);
 
-        return withTimeout().retry(retryIntervalS, shortOperationTimeoutS, TimeUnit.SECONDS, () -> SwiftPerms.execThrows(() -> {
-            try {
-                StoredObject object = blobStore.getContainer().getObject(objectName);
-                long contentLength = object.getContentLength();
-                object.delete();
-                return new DeleteResult(1, contentLength);
-            }
-            catch (NotFoundException e) {
-                // this conversion is necessary for tests to run
-                String message = "object cannot be deleted, it does not exist [" + objectName + "]";
-                logger.warn(message);
-                NoSuchFileException e2 = new NoSuchFileException(message);
-                e2.initCause(e);
-                throw e2;
-            }
-            catch (Exception e) {
-                logger.warn("object cannot be deleted [" + objectName + "]", e);
-                throw e;
-            }
-        }));
+        Object result = withTimeout().retry(retryInterval, shortOperationTimeout, retryCount,
+            () -> SwiftPerms.execThrows(() -> {
+                try {
+                    StoredObject object = blobStore.getContainer().getObject(objectName);
+                    long contentLength = object.getContentLength();
+                    object.delete();
+                    return new DeleteResult(1, contentLength);
+                }
+                catch (NotFoundException e) {
+                    // this conversion is necessary for tests to run
+                    String message = "object cannot be deleted, it does not exist [" + objectName + "]";
+                    logger.warn(message);
+                    NoSuchFileException e2 = new NoSuchFileException(message);
+                    e2.initCause(e);
+                    // do not rethrow, there is no reason to delete a missing object
+                    return e2;
+                }
+                catch (Exception e) {
+                    logger.warn("object cannot be deleted [" + objectName + "]", e);
+                    throw e;
+                }
+            }));
+
+        if (result instanceof DeleteResult){
+            return (DeleteResult) result;
+        }
+        throw (Exception) result;
     }
 
     @Override
@@ -179,36 +187,33 @@ public class SwiftBlobContainer extends AbstractBlobContainer {
         try {
             Container container = blobStore.getContainer();
             ContainerPaginationMap containerPaginationMap = new ContainerPaginationMap(container, keyPath, container.getMaxPageSize());
-            Collection<StoredObject> containerObjects = withTimeout().retry(retryIntervalS, shortOperationTimeoutS, TimeUnit.SECONDS,
-                () -> SwiftPerms.exec( () -> {
-                    try {
-                        return containerPaginationMap.listAllItems();
-                    }
-                    catch (Exception e) {
-                        logger.warn("cannot list items in [" + keyPath + "]", e);
-                        throw e;
-                    }
-                }));
+            Collection<StoredObject> containerObjects = withTimeout().retry(
+                    retryInterval, shortOperationTimeout, retryCount, () ->
+                    SwiftPerms.exec( () -> {
+                        try {
+                            return containerPaginationMap.listAllItems();
+                        }
+                        catch (Exception e) {
+                            logger.warn("cannot list items in [" + keyPath + "]", e);
+                            throw e;
+                        }
+                    }));
 
             DeleteResult results = DeleteResult.ZERO;
-            ArrayList<Exception> errors = new ArrayList<>();
 
             for (StoredObject so: containerObjects) {
+                final String blobName = so.getName().substring(keyPath.length());
+
                 try {
                     long size = SwiftPerms.exec(so::getContentLength); // length already cached, no need to retry
-                    deleteBlob(so.getName().substring(keyPath.length())); //retry happens inside the method
+                    deleteBlob(blobName); //retry happens inside the method
                     results = results.add(1, size);
                 } catch (Exception e) {
-                    errors.add(e);
+                    logger.error("Cannot delete blob [" + blobName + "]", e);
                 }
             }
 
-            if (errors.isEmpty()) {
-                return results;
-            }
-
-            String message = errors.stream().map(Exception::getMessage).collect(Collectors.joining(","));
-            throw new BlobStoreException("cannot delete blobs in path [" + keyPath + "]: " + message);
+            return results;
         }
         catch (IOException | RuntimeException e) {
            throw e;
@@ -227,32 +232,34 @@ public class SwiftBlobContainer extends AbstractBlobContainer {
     public Map<String, BlobMetaData> listBlobsByPrefix(@Nullable final String blobNamePrefix) throws IOException {
         String directoryKey = blobNamePrefix == null ? keyPath : buildKey(blobNamePrefix);
         try {
-            Collection<DirectoryOrObject> directoryList = withTimeout().retry(retryIntervalS, shortOperationTimeoutS, TimeUnit.SECONDS,
-                () -> SwiftPerms.execThrows(() -> {
-                    try {
-                        return blobStore.getContainer().listDirectory(new Directory(directoryKey, '/'));
-                    }
-                    catch (Exception e) {
-                        logger.warn("Cannot list blobs in directory [" + directoryKey + "]", e);
-                        throw e;
-                    }
-                }));
+            Collection<DirectoryOrObject> directoryList = withTimeout().retry(
+                    retryInterval, shortOperationTimeout, retryCount, () ->
+                    SwiftPerms.execThrows(() -> {
+                        try {
+                            return blobStore.getContainer().listDirectory(new Directory(directoryKey, '/'));
+                        }
+                        catch (Exception e) {
+                            logger.warn("Cannot list blobs in directory [" + directoryKey + "]", e);
+                            throw e;
+                        }
+                    }));
 
             HashMap<String, PlainBlobMetaData> blobMap = new HashMap<>();
 
             for (DirectoryOrObject obj: directoryList) {
                 if (obj.isObject()) {
                     String name = obj.getName().substring(keyPath.length());
-                    Long length = withTimeout().retry(retryIntervalS, shortOperationTimeoutS, TimeUnit.SECONDS,
-                        () -> SwiftPerms.exec(() -> {
-                            try {
-                                return obj.getAsObject().getContentLength();
-                            }
-                            catch (Exception e) {
-                                logger.warn("Cannot get object [" + obj.getName() + "]", e);
-                                throw e;
-                            }
-                        }));
+                    Long length = withTimeout().retry(
+                            retryInterval, shortOperationTimeout, retryCount, () ->
+                            SwiftPerms.exec(() -> {
+                                try {
+                                    return obj.getAsObject().getContentLength();
+                                }
+                                catch (Exception e) {
+                                    logger.warn("Cannot get object [" + obj.getName() + "]", e);
+                                    throw e;
+                                }
+                            }));
                     PlainBlobMetaData meta = new PlainBlobMetaData(name, length);
                     blobMap.put(name, meta);
                 }
@@ -280,15 +287,16 @@ public class SwiftBlobContainer extends AbstractBlobContainer {
     public Map<String, BlobContainer> children() throws IOException{
         Collection<DirectoryOrObject> objects;
         try {
-            objects = withTimeout().retry(retryIntervalS, shortOperationTimeoutS, TimeUnit.SECONDS, () -> SwiftPerms.execThrows(() -> {
-                try {
-                    return blobStore.getContainer().listDirectory(new Directory(keyPath, '/'));
-                }
-                catch (Exception e) {
-                    logger.warn("cannot list children for [" + keyPath + "]", e);
-                    throw e;
-                }
-            }));
+            objects = withTimeout().retry(retryInterval, shortOperationTimeout, retryCount, () ->
+                SwiftPerms.execThrows(() -> {
+                    try {
+                        return blobStore.getContainer().listDirectory(new Directory(keyPath, '/'));
+                    }
+                    catch (Exception e) {
+                        logger.warn("cannot list children for [" + keyPath + "]", e);
+                        throw e;
+                    }
+                }));
         }
         catch (IOException | RuntimeException e) {
             throw e;
@@ -335,18 +343,13 @@ public class SwiftBlobContainer extends AbstractBlobContainer {
         String objectName = buildKey(blobName);
 
         try {
-            return withTimeout().retry(retryIntervalS, TimeUnit.SECONDS, retryCount, () -> {
+            return withTimeout().retry(retryInterval, longOperationTimeout, retryCount, () -> {
                 try {
-                    ObjectInfo object = getObjectInfo(objectName); //retries internally
-
-                    if (streamRead) {
-                        return wrapObjectStream(objectName, object);
-                    }
-
-                    // I/O operations are timed. May throw on hash mismatch
-                    return objectToReentrantStream(objectName, object.stream, object.size, object.tag);
+                    final ObjectInfo object = getObjectInfo(objectName);
+                    return wrapObjectStream(objectName, object);
                 }
                 catch(Exception e){
+                    // if object is missing, retry (i.e., rethrow) - Swift's consistency level does not read own writes
                     logger.warn("failed to read object [" + objectName + "]", e);
                     throw e;
                 }});
@@ -373,13 +376,18 @@ public class SwiftBlobContainer extends AbstractBlobContainer {
                           final long blobSize,
                           boolean failIfAlreadyExists) throws IOException {
         if (executor != null && allowConcurrentIO && !streamWrite) {
-            // async execution races against the InputStream closed in the caller. Read all data locally.
-            InputStream capturedStream = streamToReentrantStream(in, blobSize, true, false);
+            // async execution races against the InputStream closed in the caller. Read all data from independent storage.
+            SavedBlob savedBlob = blobSaver.create(keyPath, blobName, in);
 
-            Future<Void> task = executor.submit(() -> {
-                internalWriteBlob(blobName, capturedStream, blobSize, failIfAlreadyExists);
+            Future<Void> task = executor.submit(() -> SwiftPerms.execThrows(() -> {
+                try(InputStream sbis = savedBlob.getReentrantStream()) {
+                    internalWriteBlob(blobName, sbis, blobSize, failIfAlreadyExists);
+                }
+                finally {
+                    savedBlob.close();
+                }
                 return null;
-            });
+            }));
 
             repository.addWrite(blobName, task);
             return;
@@ -394,167 +402,114 @@ public class SwiftBlobContainer extends AbstractBlobContainer {
      * @return object metadata from Swift
      * @throws Exception on timeout, I/O errors
      */
-    private ObjectInfo getObjectInfo(String objectName) throws Exception{
-        return withTimeout().retry(retryIntervalS, shortOperationTimeoutS, TimeUnit.SECONDS, () -> SwiftPerms.execThrows(() -> {
+    private ObjectInfo getObjectInfo(String objectName) throws Exception {
+        // don't retry, the caller already retries it
+        return SwiftPerms.execThrows(() -> {
+            ObjectInfo objectInfo = null;
             try {
                 StoredObject storedObject = blobStore.getContainer().getObject(objectName);
-                ObjectInfo objectInfo = new ObjectInfo();
+                objectInfo = new ObjectInfo();
                 objectInfo.stream = storedObject.downloadObjectAsInputStream();
                 objectInfo.size = storedObject.getContentLength();
                 objectInfo.tag = storedObject.getEtag();
                 return objectInfo;
-            } catch (NotFoundException e) {
-                // this conversion is necessary for tests to pass
+            }
+            catch (NotFoundException e) {
+                closeObjectStream(objectInfo, objectName);
+
+                // upstream code expect NoSuchFileException, even though this is not a file system
                 String message = "cannot read object, it does not exist [" + objectName + "]";
                 logger.warn(message);
                 NoSuchFileException e2 = new NoSuchFileException(message);
                 e2.initCause(e);
                 throw e2;
             }
-            catch (Exception e){
+            catch (Exception e) {
+                closeObjectStream(objectInfo, objectName);
                 logger.warn("cannot read object [" + objectName + "]", e);
                 throw e;
-            }
-        }));
+            }});
     }
 
-    private InputStreamWrapperWithDataHash wrapObjectStream(String objectName, ObjectInfo object) {
+    private void closeObjectStream(ObjectInfo objectInfo, String objectName){
+        if (objectInfo != null && objectInfo.stream != null){
+            try {
+                objectInfo.stream.close();
+            }
+            catch (Exception e2) {
+                logger.warn("Cannot close stream for [" + objectName + "]", e2);
+            }
+        }
+    }
+
+    private InputStream wrapObjectStream(String objectName, ObjectInfo object) {
         if (logger.isDebugEnabled()){
             logger.debug("wrapping object in unbuffered stream [" + objectName + "], size=[" + object.size +
                     "], md5=[" + object.tag + "]");
         }
-        return new InputStreamWrapperWithDataHash(objectName, object.stream, object.tag){
-            @Override
-            protected int innerRead(byte[] b) {
-                try {
-                    return withTimeout().timeout(shortOperationTimeoutS, TimeUnit.SECONDS, () -> super.innerRead(b));
-                } catch (Exception e) {
-                    throw new BlobStoreException("failure reading from [" + objectName + "]", e);
-                }
-            }
-        };
+        return new DataHashInputStream(objectName, new JossInputStream(object.stream), object.tag);
     }
 
-    /**
-     * Read object entirely into memory and check its etag. Elementary read operations are timed.
-     * @param objectName full path to the object
-     * @param rawInputStream server input stream
-     * @param size size hint, do not trust it
-     * @param objectEtag server etag (MD5 hash as hex)
-     * @return object data as memory stream
-     * @throws IOException on I/O errors or etag mismatch
-     */
-    private InputStream objectToReentrantStream(String objectName,
-                                                InputStream rawInputStream,
-                                                long size,
-                                                String objectEtag) throws IOException {
-        InputStream objectStream = streamToReentrantStream(rawInputStream, size, false, true);
-        String dataEtag = DigestUtils.md5Hex(objectStream);
-
-        if (dataEtag.equalsIgnoreCase(objectEtag)) {
-            objectStream.reset();
-            logger.debug("read object into memory [" + objectName + "], size=[" + size + "]");
-            return objectStream;
-        }
-
-        String message = "cannot read object [" + objectName + "]: server etag [" + objectEtag +
-                "] does not match calculated etag [" + dataEtag + "]";
-        logger.warn(message);
-        throw new BlobStoreException(message);
-    }
-
-    /**
-     * If the original stream was re-entrant, do nothing; otherwise, read blob entirely into memory.
-     *
-     * @param in server input stream
-     * @param sizeHint size hint, do not trust it
-     * @param forceRead force reading into memory
-     * @param useReadTimeout should read be timed? (only if actual I/O is happening, not memory duplication)
-     * @return re-entrant stream holding the blob
-     * @throws IOException on I/O error
-     */
-    private InputStream streamToReentrantStream(InputStream in,
-                                                long sizeHint,
-                                                boolean forceRead,
-                                                boolean useReadTimeout) throws IOException {
-        if (!forceRead && in.markSupported()) {
-            return in;
-        }
-
-        final int bufferSize = (int) blobStore.getBufferSizeInBytes();
-        final byte[] buffer = new byte[bufferSize];
-        ByteArrayOutputStream baos = new ByteArrayOutputStream(sizeHint > 0 ? (int) sizeHint : bufferSize) {
-            @Override
-            public byte[] toByteArray() {
-                return buf;
-            }
-        };
-
-        while (true) {
-            int read = useReadTimeout ? readWithTimeout(in, buffer) : in.read(buffer);
-            if (read == -1){
-                break;
-            }
-            baos.write(buffer, 0, read);
-        }
-
-        return new ByteArrayInputStream(baos.toByteArray());
-    }
-
-    private int readWithTimeout(InputStream in, final byte[] buffer) throws IOException {
-        try {
-            return withTimeout().timeout(shortOperationTimeoutS, TimeUnit.SECONDS, () -> in.read(buffer));
-        }
-        catch (IOException e){
-            throw e;
-        }
-        catch(Exception e){
-            throw new BlobStoreException("stream read failed", e);
-        }
-    }
-
-    private void internalWriteBlob(String blobName, InputStream fromStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
+    private void internalWriteBlob(final String blobName,
+                                   final InputStream fromStream,
+                                   final long blobSize,
+                                   final boolean failIfAlreadyExists) throws IOException {
         final String objectName = buildKey(blobName);
+        String md5 = null;
 
         if (fromStream.markSupported()){
-            fromStream.mark((int)blobSize);
+            fromStream.mark((int)Math.min(blobSize, Integer.MAX_VALUE));
+            md5 = DigestUtils.md5Hex(fromStream);
+            if (logger.isDebugEnabled()) {
+                logger.debug("Computed MD5 for [" + blobName + "]: [" + md5 + "]");
+            }
+            fromStream.reset();
         }
 
+        final String dataEtag = md5;
+
         try {
-            IOException exception = withTimeout().retry(retryIntervalS, longOperationTimeoutS, TimeUnit.SECONDS,
-                    () -> SwiftPerms.execThrows(() -> {
-                        try {
-                            StoredObject object = blobStore.getContainer().getObject(objectName);
+            IOException exception = withTimeout().retry(retryInterval, longOperationTimeout, retryCount, () ->
+                SwiftPerms.execThrows(() -> {
+                    try {
+                        StoredObject object = blobStore.getContainer().getObject(objectName);
 
-                            if (failIfAlreadyExists && blobExistsCheckAllowed && object.exists()) {
-                                return new FileAlreadyExistsException("object [" + objectName + "] already exists, cannot overwrite");
-                            }
-
-                            UploadInstructions instructions = new UploadInstructions(fromStream);
-
-                            if (fromStream.markSupported()){
-                                String dataEtag = DigestUtils.md5Hex(fromStream);
-                                instructions.setMd5(dataEtag);
-                                fromStream.reset();
-                            }
-
-                            object.uploadObject(instructions);
-                            if (logger.isDebugEnabled()){
-                                logger.debug("uploaded object [" + objectName + "], size=[" + blobSize + "], md5=[" +
-                                             instructions.getMd5() + "]");
-                            }
-                            return null;
+                        if (failIfAlreadyExists && blobExistsCheckAllowed && object.exists()) {
+                            return new FileAlreadyExistsException("object [" + objectName + "] already exists, cannot overwrite");
                         }
-                        catch (Exception e) {
-                            logger.warn("cannot write object [" + objectName + "]", e);
 
-                            if (fromStream.markSupported()){
-                                fromStream.reset();
-                            }
+                        // uploadObject() tries to close stream on failure. Don't allow this, we may retry.
+                        final CloseShieldInputStream unclosableStream = new CloseShieldInputStream(fromStream);
+                        UploadInstructions instructions = new UploadInstructions(unclosableStream);
 
-                            throw e;
+                        if (dataEtag != null) {
+                            instructions.setMd5(dataEtag);
                         }
-                    }));
+
+                        object.uploadObject(instructions);
+                        if (logger.isDebugEnabled()){
+                            logger.debug("uploaded object [" + objectName +
+                                "], size=[" + blobSize +
+                                "], md5=[" + instructions.getMd5() +
+                                "], stream=[" + fromStream +
+                                "]");
+                        }
+                        return null;
+                    }
+                    catch (StreamClosedException e) {
+                        // no retries, stream closed in another thread
+                        return e;
+                    }
+                    catch (Exception e) {
+                        logger.warn("cannot write object [" + objectName + "]", e);
+
+                        if (fromStream.markSupported()){
+                            fromStream.reset();
+                        }
+
+                        throw e;
+                    }
+                }));
 
             if (exception != null) {
                 throw exception;

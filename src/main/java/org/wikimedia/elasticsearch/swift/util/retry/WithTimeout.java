@@ -16,25 +16,45 @@
 
 package org.wikimedia.elasticsearch.swift.util.retry;
 
+import org.apache.logging.log4j.Logger;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.threadpool.ExecutorBuilder;
+import org.elasticsearch.threadpool.ScalingExecutorBuilder;
 import org.elasticsearch.threadpool.ThreadPool;
+import org.wikimedia.elasticsearch.swift.repositories.SwiftRepository;
 
 import java.util.concurrent.Callable;
-import java.util.concurrent.TimeUnit;
 
 public interface WithTimeout {
-    <T> T retry(long interval, long timeout, TimeUnit timeUnit, Callable<T> callable) throws Exception;
+    <T> T retry(TimeValue interval, TimeValue timeout, Callable<T> callable) throws Exception;
 
-    <T> T retry(long interval, TimeUnit timeUnit, int attempts, Callable<T> callable) throws Exception;
+    <T> T retry(TimeValue interval, TimeValue timeout, int attempts, Callable<T> callable) throws Exception;
 
-    <T> T timeout(long timeout, TimeUnit timeUnit, Callable<T> callable) throws Exception;
+    <T> T timeout(TimeValue timeout, Callable<T> callable) throws Exception;
 
     class Factory {
-        public WithTimeout from(ThreadPool threadPool){
-            if (threadPool == null){
-                return new WithTimeoutDirectImpl();
-            }
+        private final Logger logger;
+        private final Settings settings;
 
-            return new WithTimeoutExecutorImpl(threadPool.generic());
+        public Factory(Settings settings, Logger logger){
+            this.settings = settings;
+            this.logger = logger;
+        }
+
+        public ExecutorBuilder<?> createExecutorBuilder() {
+            return new ScalingExecutorBuilder(SwiftRepository.Swift.PREFIX,
+                1,
+                SwiftRepository.Swift.MAX_IO_REQUESTS.get(settings),
+                TimeValue.timeValueMinutes(1));
+        }
+
+        public WithTimeout create(ThreadPool threadPool){
+            return new WithTimeoutExecutorImpl(threadPool.executor(SwiftRepository.Swift.PREFIX), logger);
+        }
+
+        public WithTimeout createWithoutPool(){
+            return new WithTimeoutDirectImpl();
         }
     }
 }

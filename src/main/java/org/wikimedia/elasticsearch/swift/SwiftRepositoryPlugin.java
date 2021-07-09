@@ -16,16 +16,21 @@
 
 package org.wikimedia.elasticsearch.swift;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.elasticsearch.common.settings.Setting;
+import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.xcontent.NamedXContentRegistry;
 import org.elasticsearch.env.Environment;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.plugins.RepositoryPlugin;
 import org.elasticsearch.repositories.Repository;
+import org.elasticsearch.threadpool.ExecutorBuilder;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.wikimedia.elasticsearch.swift.repositories.SwiftRepository;
 import org.wikimedia.elasticsearch.swift.repositories.SwiftService;
 import org.wikimedia.elasticsearch.swift.repositories.account.SwiftAccountFactoryImpl;
+import org.wikimedia.elasticsearch.swift.util.retry.WithTimeout;
 
 import java.util.Arrays;
 import java.util.Collections;
@@ -36,6 +41,8 @@ import java.util.Map;
  * Our base plugin stuff.
  */
 public class SwiftRepositoryPlugin extends Plugin implements RepositoryPlugin {
+    private static final Logger logger = LogManager.getLogger(SwiftRepositoryPlugin.class);
+
     @Override
     public Map<String, Repository.Factory> getRepositories(final Environment env,
                                                            final NamedXContentRegistry registry,
@@ -69,14 +76,20 @@ public class SwiftRepositoryPlugin extends Plugin implements RepositoryPlugin {
     public List<Setting<?>> getSettings() {
         return Arrays.asList(SwiftRepository.Swift.MINIMIZE_BLOB_EXISTS_CHECKS_SETTING,
                              SwiftRepository.Swift.ALLOW_CACHING_SETTING,
-                             SwiftRepository.Swift.DELETE_TIMEOUT_MIN_SETTING,
-                             SwiftRepository.Swift.SNAPSHOT_TIMEOUT_MIN_SETTING,
-                             SwiftRepository.Swift.SHORT_OPERATION_TIMEOUT_S_SETTING,
-                             SwiftRepository.Swift.LONG_OPERATION_TIMEOUT_S_SETTING,
-                             SwiftRepository.Swift.RETRY_INTERVAL_S_SETTING,
+                             SwiftRepository.Swift.DELETE_TIMEOUT_SETTING,
+                             SwiftRepository.Swift.SNAPSHOT_TIMEOUT_SETTING,
+                             SwiftRepository.Swift.SHORT_OPERATION_TIMEOUT_SETTING,
+                             SwiftRepository.Swift.LONG_OPERATION_TIMEOUT_SETTING,
+                             SwiftRepository.Swift.RETRY_INTERVAL_SETTING,
                              SwiftRepository.Swift.RETRY_COUNT_SETTING,
                              SwiftRepository.Swift.ALLOW_CONCURRENT_IO_SETTING,
-                             SwiftRepository.Swift.STREAM_READ_SETTING,
-                             SwiftRepository.Swift.STREAM_WRITE_SETTING);
+                             SwiftRepository.Swift.STREAM_WRITE_SETTING,
+                             SwiftRepository.Swift.BLOB_LOCAL_DIR_SETTING);
+    }
+
+    @Override
+    public List<ExecutorBuilder<?>> getExecutorBuilders(Settings settings){
+        return Collections.singletonList(
+            new WithTimeout.Factory(settings, logger).createExecutorBuilder());
     }
 }
